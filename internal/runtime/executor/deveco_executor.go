@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/deveco"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -23,6 +25,9 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/sjson"
 )
+
+// modelAPIURL is the Huawei API endpoint for fetching available models.
+const modelAPIURL = deveco.DevEcoBaseURL + "/codeGenie/modelConfig"
 
 // DevecoExecutor implements ProviderExecutor for Huawei DevEco Code's MaaS API.
 type DevecoExecutor struct {
@@ -43,16 +48,15 @@ func NewDevecoExecutor(cfg *config.Config) *DevecoExecutor {
 // Identifier implements coreauth.ProviderExecutor.
 func (e *DevecoExecutor) Identifier() string { return e.provider }
 
-func (e *DevecoExecutor) resolveAuth(auth *coreauth.Auth) (baseURL, apiKey string) {
+func (e *DevecoExecutor) resolveAuth(auth *coreauth.Auth) string {
 	if auth == nil || auth.Attributes == nil {
-		return "", ""
+		return ""
 	}
-	baseURL = strings.TrimSpace(auth.Attributes["base_url"])
-	apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+	baseURL := strings.TrimSpace(auth.Attributes["base_url"])
 	if baseURL == "" {
 		baseURL = deveco.DevEcoBaseURL + "/sse/codeGenie/maas/v2"
 	}
-	return
+	return baseURL
 }
 
 // Execute handles non-streaming DevEco API requests.
@@ -78,16 +82,24 @@ func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req c
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
+	// Avoid duplicate translation when originalPayload == req.Payload (common case)
+	originalTranslated := translated
+	if len(opts.OriginalRequest) > 0 {
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
+	}
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	// DevEco non-streaming: /no-stream/chat/completions
-	baseURL, _ := e.resolveAuth(auth)
+	baseURL := e.resolveAuth(auth)
 	url := strings.TrimSuffix(baseURL, "/") + "/no-stream/chat/completions"
 	body := translated
 	if !opts.Stream {
-		body, _ = sjson.SetBytes(body, "stream", false)
+		if b, setErr := sjson.SetBytes(body, "stream", false); setErr != nil {
+			log.Warnf("deveco: failed to set stream=false: %v", setErr)
+		} else {
+			body = b
+		}
 	}
 
 	var httpReq *http.Request
@@ -160,13 +172,21 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+	// Avoid duplicate translation when originalPayload == req.Payload (common case)
+	originalTranslated := translated
+	if len(opts.OriginalRequest) > 0 {
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+	}
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	if t, setErr := sjson.SetBytes(translated, "stream_options.include_usage", true); setErr != nil {
+		log.Warnf("deveco: failed to set stream_options.include_usage: %v", setErr)
+	} else {
+		translated = t
+	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	// DevEco streaming: standard /chat/completions
-	baseURL, _ := e.resolveAuth(auth)
+	baseURL := e.resolveAuth(auth)
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 
 	var httpReq *http.Request
@@ -242,6 +262,14 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 			case <-ctx.Done():
 				return
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			log.Errorf("deveco: stream read error for auth %s: %v", auth.ID, err)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Payload: []byte(fmt.Sprintf(`data: {"error":"stream read error: %v"}`, err))}:
+			case <-ctx.Done():
+			}
+			return
 		}
 		reporter.EnsurePublished(ctx)
 	}()
@@ -332,4 +360,110 @@ func newChatID() string {
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// FetchAndRegisterDevecoModels fetches the latest model list from the Huawei DevEco API
+// and registers them in the global model registry. This enables dynamic model discovery
+// (e.g., GLM-5.1 when it becomes available through the user's account).
+// The httpClient should be proxy-aware; use nil to create a default client.
+func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, installationVersion string, httpClient *http.Client) ([]*registry.ModelInfo, error) {
+	url := fmt.Sprintf("%s?localVersion=0&pluginVersion=CLI.%s", modelAPIURL, installationVersion)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("deveco fetch models: create req: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 10 * time.Second}
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("deveco fetch models: http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("deveco fetch models: read: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("deveco fetch models: HTTP %d", resp.StatusCode)
+	}
+
+	// Parse the Huawei model config API response
+	var apiResp struct {
+		Code int `json:"code"`
+		Body struct {
+			Version     int `json:"version"`
+			InnerModels []struct {
+				Protocol        string `json:"protocol"`
+				GroupName       string `json:"group_name"`
+				GroupNameCN     string `json:"group_name_cn,omitempty"`
+				ModelConfigs    []struct {
+					ID              int      `json:"id"`
+					ModelID         string   `json:"model_id"`
+					ThinkingMode    string   `json:"thinking_mode"`
+					InputModalities []string `json:"input_modalities,omitempty"`
+					ContextWindow   int      `json:"context_window,omitempty"`
+					Output          int      `json:"output,omitempty"`
+					ToolCallMode    string   `json:"tool_call_mode"`
+				} `json:"model_configs"`
+			} `json:"inner_models"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return nil, fmt.Errorf("deveco fetch models: parse: %w", err)
+	}
+	if apiResp.Code != 200 {
+		return nil, fmt.Errorf("deveco fetch models: API code %d", apiResp.Code)
+	}
+
+	models := make([]*registry.ModelInfo, 0)
+	for _, group := range apiResp.Body.InnerModels {
+		for _, mc := range group.ModelConfigs {
+			ctxLen := mc.ContextWindow
+			if ctxLen <= 0 {
+				ctxLen = 202752
+			}
+			maxOut := mc.Output
+			if maxOut <= 0 {
+				maxOut = 131072
+			}
+			models = append(models, &registry.ModelInfo{
+				ID:                 mc.ModelID,
+				Object:             "model",
+				OwnedBy:            "deveco",
+				Type:               "deveco",
+				DisplayName:        mc.ModelID,
+				ContextLength:      ctxLen,
+				MaxCompletionTokens: maxOut,
+			})
+		}
+	}
+	return models, nil
+}
+
+// FetchDevecoModelsDynamic fetches models from the Huawei DevEco API and returns them.
+// Falls back to default models if the API call fails or returns empty.
+func FetchDevecoModelsDynamic(ctx context.Context, cfg *config.Config, auth *coreauth.Auth) []*registry.ModelInfo {
+	accessToken := extractAccessToken(auth)
+	if accessToken == "" {
+		log.Debug("deveco: no access token for dynamic model fetch, using defaults")
+		return registry.GetDevecoModels()
+	}
+
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 10*time.Second)
+	models, err := FetchAndRegisterDevecoModels(ctx, accessToken, "1.0.0", httpClient)
+	if err != nil {
+		log.Debugf("deveco: dynamic model fetch failed (%v), using defaults", err)
+		return registry.GetDevecoModels()
+	}
+
+	if len(models) == 0 {
+		return registry.GetDevecoModels()
+	}
+	log.Infof("deveco: fetched %d models from API", len(models))
+	return models
 }

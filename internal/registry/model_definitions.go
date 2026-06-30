@@ -121,6 +121,15 @@ func GetDevecoModels() []*ModelInfo {
 	// Fallback default models when not defined in models.json
 	return []*ModelInfo{
 		{
+			ID:                  "glm-5.1",
+			Object:              "model",
+			OwnedBy:             "deveco",
+			Type:                "deveco",
+			DisplayName:         "GLM-5.1",
+			ContextLength:       202752,
+			MaxCompletionTokens: 131072,
+		},
+		{
 			ID:                 "glm-5",
 			Object:             "model",
 			OwnedBy:            "deveco",
@@ -327,6 +336,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAntigravityModels()
 	case "xai", "x-ai", "grok":
 		return GetXAIModels()
+	case "deveco":
+		return GetDevecoModels()
 	default:
 		return nil
 	}
@@ -349,6 +360,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Kimi,
 		data.Antigravity,
 		data.XAI,
+		data.Deveco,
 	}
 	for _, models := range allModels {
 		for _, m := range models {

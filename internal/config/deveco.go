@@ -38,3 +38,13 @@ func (cfg *Config) SanitizeDevecoKeys() {
 		}
 	}
 }
+
+// HasEnabledDeveco returns true if there is at least one enabled DevEco config entry.
+func (cfg *Config) HasEnabledDeveco() bool {
+	for i := range cfg.Deveco {
+		if cfg.Deveco[i].Enabled {
+			return true
+		}
+	}
+	return false
+}

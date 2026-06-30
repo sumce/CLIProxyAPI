@@ -31,6 +31,7 @@ func (ts *DevecoTokenStorage) SetMetadata(meta map[string]any) {
 }
 
 // SaveTokenToFile writes DevEco credentials to a JSON auth file.
+// Writes to a temp file first, then renames to prevent partial writes.
 func (ts *DevecoTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "deveco"
@@ -38,20 +39,32 @@ func (ts *DevecoTokenStorage) SaveTokenToFile(authFilePath string) error {
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0o700); err != nil {
 		return fmt.Errorf("deveco token storage: create dir: %w", err)
 	}
-	file, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("deveco token storage: create file: %w", err)
-	}
-	defer file.Close()
 
 	data, err := misc.MergeMetadata(ts, ts.Metadata)
 	if err != nil {
 		return fmt.Errorf("deveco token storage: merge metadata: %w", err)
 	}
+
+	// Write to temp file first, then rename to prevent zero-length file on failure.
+	tmpPath := authFilePath + ".tmp"
+	file, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("deveco token storage: create temp file: %w", err)
+	}
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(data); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("deveco token storage: encode: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("deveco token storage: close temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, authFilePath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("deveco token storage: rename: %w", err)
 	}
 	return nil
 }

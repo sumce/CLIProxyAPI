@@ -80,12 +80,15 @@ func (s *CallbackServer) Stop() error {
 
 // WaitForCallback blocks until the OAuth callback is received or timeout expires.
 func (s *CallbackServer) WaitForCallback(ctx context.Context, timeout time.Duration) (*CallbackData, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case data := <-s.resultCh:
 		return data, nil
 	case err := <-s.errCh:
 		return nil, err
-	case <-time.After(timeout):
+	case <-timer.C:
 		return nil, fmt.Errorf("deveco callback: timeout after %v", timeout)
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -122,25 +125,37 @@ func (s *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) 
 
 	if quit == "true" || quit == "access_denied" {
 		log.Info("deveco callback: user cancelled login")
-		s.errCh <- fmt.Errorf("login cancelled by user")
+		select {
+		case s.errCh <- fmt.Errorf("login cancelled by user"):
+		default:
+		}
 		http.Redirect(w, r, s.baseURL+"/"+s.failedRedirectURL, http.StatusFound)
 		return
 	}
 
 	if tempToken == "" || siteID == "" {
 		log.Error("deveco callback: missing tempToken or siteId")
-		s.errCh <- fmt.Errorf("login failed: missing credentials")
+		select {
+		case s.errCh <- fmt.Errorf("login failed: missing credentials"):
+		default:
+		}
 		http.Redirect(w, r, s.baseURL+"/"+s.failedRedirectURL, http.StatusFound)
 		return
 	}
 
 	if siteID != "1" {
 		log.Errorf("deveco callback: unsupported region siteId=%s", siteID)
-		s.errCh <- fmt.Errorf("unsupported region: only China site accounts are supported")
+		select {
+		case s.errCh <- fmt.Errorf("unsupported region: only China site accounts are supported"):
+		default:
+		}
 		http.Redirect(w, r, s.baseURL+"/"+s.failedRedirectURL, http.StatusFound)
 		return
 	}
 
-	s.resultCh <- &CallbackData{TempToken: tempToken, SiteID: siteID, Quit: quit}
+	select {
+	case s.resultCh <- &CallbackData{TempToken: tempToken, SiteID: siteID, Quit: quit}:
+	default:
+	}
 	http.Redirect(w, r, s.baseURL+"/"+s.successRedirectURL, http.StatusFound)
 }

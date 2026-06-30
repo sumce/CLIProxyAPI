@@ -992,6 +992,7 @@ func baselineExecutorAuths() []*coreauth.Auth {
 		"antigravity",
 		"kimi",
 		"xai",
+		"deveco",
 		"openai-compatibility",
 	}
 	auths := make([]*coreauth.Auth, 0, len(providers))
@@ -2016,7 +2017,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	case "deveco":
-		models = registry.GetDevecoModels()
+		models = executor.FetchDevecoModelsDynamic(ctx, s.cfg, a)
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config

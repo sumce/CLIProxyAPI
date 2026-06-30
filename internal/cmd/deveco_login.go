@@ -3,6 +3,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -29,7 +31,10 @@ func DoDevecoLogin(cfg *config.Config, options *LoginOptions) {
 		Prompt:       options.Prompt,
 	}
 
-	record, savedPath, err := manager.Login(context.Background(), "deveco", cfg, authOpts)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	record, savedPath, err := manager.Login(ctx, "deveco", cfg, authOpts)
 	if err != nil {
 		log.Errorf("DevEco authentication failed: %v", err)
 		return

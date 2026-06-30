@@ -175,7 +175,12 @@ func (d *DevecoAuth) refreshTokenCall(ctx context.Context, jwtToken string) (*Lo
 		return nil, fmt.Errorf("deveco refresh: read: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("deveco refresh: HTTP %d: %s", resp.StatusCode, string(body))
+		// Truncate error body to avoid leaking credentials in logs
+		errBody := string(body)
+		if len(errBody) > 256 {
+			errBody = errBody[:256] + "..."
+		}
+		return nil, fmt.Errorf("deveco refresh: HTTP %d: %s", resp.StatusCode, errBody)
 	}
 
 	var result struct {
@@ -192,7 +197,10 @@ func (d *DevecoAuth) refreshTokenCall(ctx context.Context, jwtToken string) (*Lo
 		return nil, fmt.Errorf("deveco refresh: invalid response")
 	}
 
-	claims := parseJWT(jwtToken)
+	claims, err := parseJWT(jwtToken)
+	if err != nil {
+		return nil, fmt.Errorf("deveco refresh: parse JWT: %w", err)
+	}
 	return &LoginResult{
 		AccessToken:  result.UserInfo.AccessToken,
 		RefreshToken: result.UserInfo.RefreshToken,
@@ -204,9 +212,8 @@ func (d *DevecoAuth) refreshTokenCall(ctx context.Context, jwtToken string) (*Lo
 }
 
 func (d *DevecoAuth) exchangeTempToken(ctx context.Context, tempToken string) (string, error) {
-	actual := strings.Split(tempToken, "&")[0]
 	reqURL := fmt.Sprintf("%s/%s?tempToken=%s&site=CN&version=1.0.0&appid=%s",
-		DevEcoBaseURL, tempTokenCheckURL, url.QueryEscape(actual), appID)
+		DevEcoBaseURL, tempTokenCheckURL, url.QueryEscape(tempToken), appID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("exchange temp token: %w", err)
@@ -224,7 +231,11 @@ func (d *DevecoAuth) exchangeTempToken(ctx context.Context, tempToken string) (s
 		return "", fmt.Errorf("exchange temp token: read: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("exchange temp token: HTTP %d: %s", resp.StatusCode, string(body))
+		errBody := string(body)
+		if len(errBody) > 256 {
+			errBody = errBody[:256] + "..."
+		}
+		return "", fmt.Errorf("exchange temp token: HTTP %d: %s", resp.StatusCode, errBody)
 	}
 
 	jwtToken := strings.TrimSpace(string(body))
@@ -255,7 +266,11 @@ func (d *DevecoAuth) checkJWT(ctx context.Context, jwtToken string) (*JWTUserInf
 		return nil, fmt.Errorf("check JWT: read: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("check JWT: HTTP %d: %s", resp.StatusCode, string(body))
+		errBody := string(body)
+		if len(errBody) > 256 {
+			errBody = errBody[:256] + "..."
+		}
+		return nil, fmt.Errorf("check JWT: HTTP %d: %s", resp.StatusCode, errBody)
 	}
 
 	var r struct {
@@ -273,7 +288,10 @@ func (d *DevecoAuth) checkJWT(ctx context.Context, jwtToken string) (*JWTUserInf
 		return nil, fmt.Errorf("check JWT: invalid response")
 	}
 
-	claims := parseJWT(jwtToken)
+	claims, err := parseJWT(jwtToken)
+	if err != nil {
+		return nil, fmt.Errorf("check JWT: parse JWT: %w", err)
+	}
 	isRealName := false
 	switch v := r.UserInfo.RealName.(type) {
 	case bool:
@@ -291,10 +309,11 @@ func (d *DevecoAuth) checkJWT(ctx context.Context, jwtToken string) (*JWTUserInf
 }
 
 // parseJWT decodes the JWT payload without signature verification.
-func parseJWT(token string) *JWTClaims {
+// Returns an error if the token structure or payload is invalid.
+func parseJWT(token string) (*JWTClaims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return &JWTClaims{}
+		return nil, fmt.Errorf("deveco parse JWT: expected 3 parts, got %d", len(parts))
 	}
 	// base64url → base64
 	payload := parts[1]
@@ -308,13 +327,13 @@ func parseJWT(token string) *JWTClaims {
 	}
 	decoded, err := base64.StdEncoding.DecodeString(padded)
 	if err != nil {
-		return &JWTClaims{}
+		return nil, fmt.Errorf("deveco parse JWT: base64 decode: %w", err)
 	}
 	var claims JWTClaims
 	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return &JWTClaims{}
+		return nil, fmt.Errorf("deveco parse JWT: json decode: %w", err)
 	}
-	return &claims
+	return &claims, nil
 }
 
 func generateClientSecret() (string, error) {
