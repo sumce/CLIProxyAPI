@@ -397,6 +397,7 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 				DisplayName:        mc.ModelID,
 				ContextLength:      ctxLen,
 				MaxCompletionTokens: maxOut,
+				Thinking:           parseDevecoThinkingMode(mc.ThinkingMode),
 			})
 		}
 	}
@@ -424,4 +425,22 @@ func FetchDevecoModelsDynamic(ctx context.Context, cfg *config.Config, auth *cor
 	}
 	log.Infof("deveco: fetched %d models from API", len(models))
 	return models
+}
+
+// parseDevecoThinkingMode maps Huawei's thinking_mode string to ThinkingSupport.
+// Values observed from Huawei API: "deep" (full reasoning), "quick" (fast response),
+// empty/absent (no thinking support). Maps "deep" to enabled thinking.
+func parseDevecoThinkingMode(mode string) *registry.ThinkingSupport {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "deep", "deep_think", "reasoning":
+		return &registry.ThinkingSupport{
+			Min:  0,
+			Max:  8192,
+			ZeroAllowed:   true,
+			DynamicAllowed: true,
+			Levels: []string{"low", "medium", "high"},
+		}
+	default:
+		return nil
+	}
 }

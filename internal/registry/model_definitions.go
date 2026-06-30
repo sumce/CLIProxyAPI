@@ -128,6 +128,13 @@ func GetDevecoModels() []*ModelInfo {
 			DisplayName:         "GLM-5.1",
 			ContextLength:       202752,
 			MaxCompletionTokens: 131072,
+			Thinking: &ThinkingSupport{
+				Min:            0,
+				Max:            8192,
+				ZeroAllowed:    true,
+				DynamicAllowed: true,
+				Levels:         []string{"low", "medium", "high"},
+			},
 		},
 		{
 			ID:                 "glm-5",
@@ -137,6 +144,13 @@ func GetDevecoModels() []*ModelInfo {
 			DisplayName:        "GLM-5",
 			ContextLength:      202752,
 			MaxCompletionTokens: 131072,
+			Thinking: &ThinkingSupport{
+				Min:            0,
+				Max:            8192,
+				ZeroAllowed:    true,
+				DynamicAllowed: true,
+				Levels:         []string{"low", "medium", "high"},
+			},
 		},
 		{
 			ID:                 "Qwen2.5-VL-72B",
