@@ -416,7 +416,7 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 		return extractGeminiConfig(body, provider)
 	case "openai":
 		return extractOpenAIConfig(body)
-	case "codex", "xai":
+	case "codex", "xai", "openai-response":
 		return extractCodexConfig(body)
 	case "kimi":
 		// Kimi uses OpenAI-compatible reasoning_effort format
@@ -612,17 +612,30 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 //
 // OpenAI API format:
 //   - reasoning_effort: "none", "low", "medium", "high" (discrete levels)
+//   - thinking.type: "enabled" (alternative, some providers like Huawei/GLM use this)
 //
 // OpenAI uses level-based thinking configuration only, no numeric budget support.
 // The "none" value is treated specially to return ModeNone.
 func extractOpenAIConfig(body []byte) ThinkingConfig {
-	// Check reasoning_effort (OpenAI Chat Completions format)
+	// Check reasoning_effort (OpenAI Chat Completions format, standard)
 	if effort := gjson.GetBytes(body, "reasoning_effort"); effort.Exists() {
 		value := effort.String()
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
 		}
 		return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
+	}
+
+	// Check thinking.type (alternative format used by some providers, e.g. Huawei/GLM).
+	// Claude bodies also use thinking.type="enabled", but they pair it with
+	// thinking.budget_tokens and must be handled by extractClaudeConfig. Since this
+	// extractor is also reused for cross-format extraction (e.g. openai->claude on
+	// user-defined models), only treat thinking.type as an OpenAI-style signal when
+	// no budget_tokens is present — OpenAI/GLM bodies never carry budget_tokens.
+	if thinking := gjson.GetBytes(body, "thinking.type"); thinking.Exists() && thinking.String() == "enabled" {
+		if !gjson.GetBytes(body, "thinking.budget_tokens").Exists() {
+			return ThinkingConfig{Mode: ModeLevel, Level: "medium"}
+		}
 	}
 
 	return ThinkingConfig{}

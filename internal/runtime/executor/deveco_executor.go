@@ -23,6 +23,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -59,39 +60,155 @@ func (e *DevecoExecutor) resolveAuth(auth *coreauth.Auth) string {
 	return baseURL
 }
 
+// aggregatedDelta accumulates content and reasoning_content from streaming
+// SSE delta chunks into a single complete chat-completions response.
+type aggregatedDelta struct {
+	ID               string
+	Model            string
+	Created          int64
+	Content          strings.Builder
+	ReasoningContent strings.Builder
+	Usage            json.RawMessage
+}
+
+func (a *aggregatedDelta) ingest(line []byte) {
+	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return
+	}
+	if id := gjson.GetBytes(payload, "id").String(); id != "" {
+		a.ID = id
+	}
+	if model := gjson.GetBytes(payload, "model").String(); model != "" {
+		a.Model = model
+	}
+	if created := gjson.GetBytes(payload, "created").Int(); created > 0 {
+		a.Created = created
+	}
+	if delta := gjson.GetBytes(payload, "choices.0.delta"); delta.Exists() {
+		if content := delta.Get("content").String(); content != "" {
+			a.Content.WriteString(content)
+		}
+		if rc := delta.Get("reasoning_content").String(); rc != "" {
+			a.ReasoningContent.WriteString(rc)
+		}
+	}
+	if usage := gjson.GetBytes(payload, "usage"); usage.Exists() && usage.IsObject() {
+		a.Usage = json.RawMessage(usage.Raw)
+	}
+}
+
+func (a *aggregatedDelta) toCompleteResponse() []byte {
+	out := []byte(`{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""}}]}`)
+	if a.ID != "" {
+		out, _ = sjson.SetBytes(out, "id", a.ID)
+	}
+	if a.Model != "" {
+		out, _ = sjson.SetBytes(out, "model", a.Model)
+	}
+	if a.Created > 0 {
+		out, _ = sjson.SetBytes(out, "created", a.Created)
+	}
+	if a.Content.Len() > 0 {
+		out, _ = sjson.SetBytes(out, "choices.0.message.content", a.Content.String())
+	}
+	if a.ReasoningContent.Len() > 0 {
+		out, _ = sjson.SetBytes(out, "choices.0.message.reasoning_content", a.ReasoningContent.String())
+	}
+	if len(a.Usage) > 0 {
+		out, _ = sjson.SetRawBytes(out, "usage", a.Usage)
+	}
+	return out
+}
+
 // Execute handles non-streaming DevEco API requests.
 // Internally uses the streaming endpoint (/chat/completions) for consistent latency,
 // collects all SSE chunks, and assembles the final response. This avoids the
 // unpredictable latency of Huawei's /no-stream/chat/completions endpoint (2s-90s).
+//
+// Unlike the streaming path, this method aggregates all streaming delta chunks
+// into a single complete chat-completions response before calling TranslateNonStream.
+// This is necessary because TranslateNonStream expects complete message format
+// (choices[0].message.reasoning_content), not streaming delta format (choices[0].delta.reasoning_content).
 func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	// Execute as streaming internally for consistent upstream latency.
-	streamOpts := opts
-	streamOpts.Stream = true
-	streamResult, err := e.ExecuteStream(ctx, auth, req, streamOpts)
-	if err != nil {
+	// Prepare request body (same as ExecuteStream)
+	translated, _, errPrepare := e.prepareStreamRequest(ctx, auth, req, opts)
+	if errPrepare != nil {
+		err = errPrepare
 		return cliproxyexecutor.Response{}, err
 	}
 
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
-	var fullBody bytes.Buffer
-	for chunk := range streamResult.Chunks {
-		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, nil, chunk.Payload, nil)
-		if len(out) > 0 {
-			fullBody.Write(out)
+	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	baseURL := e.resolveAuth(auth)
+	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+
+	var httpReq *http.Request
+	httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	e.injectHeaders(httpReq, auth)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Cache-Control", "no-cache")
+	util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
+
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+		URL: url, Method: http.MethodPost, Headers: httpReq.Header.Clone(),
+		Body: translated, Provider: e.Identifier(), AuthID: auth.ID,
+	})
+
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient = reporter.TrackHTTPClient(httpClient)
+	var httpResp *http.Response
+	httpResp, err = httpClient.Do(httpReq)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return cliproxyexecutor.Response{}, err
+	}
+	defer httpResp.Body.Close()
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		var b []byte
+		b, _ = io.ReadAll(httpResp.Body)
+		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
+	}
+
+	// Read SSE stream and aggregate all delta chunks into a complete response.
+	scanner := bufio.NewScanner(httpResp.Body)
+	scanner.Buffer(nil, 52_428_800)
+	var delta aggregatedDelta
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
 		}
-		reporter.Publish(ctx, helps.ParseOpenAIUsage(chunk.Payload))
+		if !bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		delta.ingest(trimmed)
+		if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
+			reporter.Publish(ctx, detail)
+		}
+	}
+	if errScan := scanner.Err(); errScan != nil {
+		log.Errorf("deveco: stream read error for auth %s: %v", auth.ID, errScan)
 	}
 	reporter.EnsurePublished(ctx)
-	headers := streamResult.Headers
-	if headers == nil {
-		headers = make(http.Header)
-	}
-	return cliproxyexecutor.Response{Payload: fullBody.Bytes(), Headers: headers}, nil
+
+	// Translate the complete aggregated response once.
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	var param any
+	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, delta.toCompleteResponse(), &param)
+
+	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 }
 
 // prepareStreamRequest performs the common request preparation steps for streaming.
@@ -110,6 +227,18 @@ func (e *DevecoExecutor) prepareStreamRequest(ctx context.Context, auth *coreaut
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, "", err
+	}
+
+	// Huawei's DevEco MaaS API requires BOTH reasoning_effort AND thinking.type
+	// to actually return reasoning_content. Sending only reasoning_effort yields
+	// zero reasoning lines. When a non-empty/non-"none" effort is present, mirror
+	// it with thinking.type=enabled so GLM models emit their reasoning stream.
+	if effort := gjson.GetBytes(translated, "reasoning_effort"); effort.Exists() {
+		if v := effort.String(); v != "" && v != "none" {
+			if t, setErr := sjson.SetBytes(translated, "thinking.type", "enabled"); setErr == nil {
+				translated = t
+			}
+		}
 	}
 
 	requestedModel = helps.PayloadRequestedModel(opts, req.Model)
@@ -350,25 +479,31 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 		return nil, fmt.Errorf("deveco fetch models: HTTP %d", resp.StatusCode)
 	}
 
-	// Parse the Huawei model config API response
+	// Parse the Huawei model config API response.
+	// inner_models and outer_models share the same shape; both are processed so
+	// that models served from either bucket are registered (outer_models is
+	// currently empty but Huawei may populate it).
+	type devecoModelConfig struct {
+		ID              int      `json:"id"`
+		ModelID         string   `json:"model_id"`
+		ThinkingMode    string   `json:"thinking_mode"`
+		InputModalities []string `json:"input_modalities,omitempty"`
+		ContextWindow   int      `json:"context_window,omitempty"`
+		Output          int      `json:"output,omitempty"`
+		ToolCallMode    string   `json:"tool_call_mode"`
+	}
+	type devecoModelGroup struct {
+		Protocol     string              `json:"protocol"`
+		GroupName    string              `json:"group_name"`
+		GroupNameCN  string              `json:"group_name_cn,omitempty"`
+		ModelConfigs []devecoModelConfig `json:"model_configs"`
+	}
 	var apiResp struct {
 		Code int `json:"code"`
 		Body struct {
-			Version     int `json:"version"`
-			InnerModels []struct {
-				Protocol        string `json:"protocol"`
-				GroupName       string `json:"group_name"`
-				GroupNameCN     string `json:"group_name_cn,omitempty"`
-				ModelConfigs    []struct {
-					ID              int      `json:"id"`
-					ModelID         string   `json:"model_id"`
-					ThinkingMode    string   `json:"thinking_mode"`
-					InputModalities []string `json:"input_modalities,omitempty"`
-					ContextWindow   int      `json:"context_window,omitempty"`
-					Output          int      `json:"output,omitempty"`
-					ToolCallMode    string   `json:"tool_call_mode"`
-				} `json:"model_configs"`
-			} `json:"inner_models"`
+			Version     int                `json:"version"`
+			InnerModels []devecoModelGroup `json:"inner_models"`
+			OuterModels []devecoModelGroup `json:"outer_models"`
 		} `json:"body"`
 	}
 	if err := json.Unmarshal(body, &apiResp); err != nil {
@@ -379,8 +514,18 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 	}
 
 	models := make([]*registry.ModelInfo, 0)
-	for _, group := range apiResp.Body.InnerModels {
+	groups := append(append([]devecoModelGroup{}, apiResp.Body.InnerModels...), apiResp.Body.OuterModels...)
+	seen := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
 		for _, mc := range group.ModelConfigs {
+			if mc.ModelID == "" {
+				continue
+			}
+			// Deduplicate in case a model appears in both buckets.
+			if _, dup := seen[mc.ModelID]; dup {
+				continue
+			}
+			seen[mc.ModelID] = struct{}{}
 			ctxLen := mc.ContextWindow
 			if ctxLen <= 0 {
 				ctxLen = 202752
@@ -389,13 +534,13 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 			if maxOut <= 0 {
 				maxOut = 131072
 			}
-			thinking := parseDevecoThinkingMode(mc.ThinkingMode)
+			thinkingSupport := parseDevecoThinkingMode(mc.ThinkingMode)
 			// If the model is known to support reasoning (GLM-5.1, GLM-5), always enable
 			// thinking regardless of API thinking_mode value.
-			if thinking == nil {
+			if thinkingSupport == nil {
 				switch mc.ModelID {
 				case "GLM-5.1", "GLM-5", "glm-5.1", "glm-5":
-					thinking = &registry.ThinkingSupport{
+					thinkingSupport = &registry.ThinkingSupport{
 						Min:            0,
 						Max:            8192,
 						ZeroAllowed:    true,
@@ -405,14 +550,14 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 				}
 			}
 			models = append(models, &registry.ModelInfo{
-				ID:                 mc.ModelID,
-				Object:             "model",
-				OwnedBy:            "deveco",
-				Type:               "deveco",
-				DisplayName:        mc.ModelID,
-				ContextLength:      ctxLen,
+				ID:                  mc.ModelID,
+				Object:              "model",
+				OwnedBy:             "deveco",
+				Type:                "deveco",
+				DisplayName:         mc.ModelID,
+				ContextLength:       ctxLen,
 				MaxCompletionTokens: maxOut,
-				Thinking:           thinking,
+				Thinking:            thinkingSupport,
 			})
 		}
 	}
@@ -443,17 +588,17 @@ func FetchDevecoModelsDynamic(ctx context.Context, cfg *config.Config, auth *cor
 }
 
 // parseDevecoThinkingMode maps Huawei's thinking_mode string to ThinkingSupport.
-// Values observed from Huawei API: "deep" (full reasoning), "quick" (fast response),
-// empty/absent (no thinking support). Maps "deep" to enabled thinking.
+// Values observed from Huawei API: "on" / "deep" (full reasoning),
+// "configurable" (optional), empty/absent (no thinking support).
 func parseDevecoThinkingMode(mode string) *registry.ThinkingSupport {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "deep", "deep_think", "reasoning":
+	case "on", "deep", "deep_think", "reasoning", "configurable":
 		return &registry.ThinkingSupport{
-			Min:  0,
-			Max:  8192,
-			ZeroAllowed:   true,
+			Min:            0,
+			Max:            8192,
+			ZeroAllowed:    true,
 			DynamicAllowed: true,
-			Levels: []string{"low", "medium", "high"},
+			Levels:         []string{"low", "medium", "high"},
 		}
 	default:
 		return nil

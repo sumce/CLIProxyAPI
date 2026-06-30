@@ -243,6 +243,10 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 		out, _ = sjson.SetBytes(out, "top_logprobs", topLogprobs.Int())
 	}
 
+	if reasoningEffort := root.Get("reasoning_effort"); reasoningEffort.Exists() {
+		out, _ = sjson.SetBytes(out, "reasoning_effort", reasoningEffort.String())
+	}
+
 	if echo := root.Get("echo"); echo.Exists() {
 		out, _ = sjson.SetBytes(out, "echo", echo.Bool())
 	}
