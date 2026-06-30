@@ -28,6 +28,7 @@ type staticModelsJSON struct {
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
 	XAI         []*ModelInfo `json:"xai"`
+	Deveco      []*ModelInfo `json:"deveco"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -108,6 +109,36 @@ func AntigravityWebSearchModelFor(modelID string) string {
 // GetXAIModels returns the standard xAI Grok model definitions.
 func GetXAIModels() []*ModelInfo {
 	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
+}
+
+// GetDevecoModels returns default model definitions for Huawei DevEco Code.
+// These models can be overridden by dynamic model fetching from the DevEco API.
+func GetDevecoModels() []*ModelInfo {
+	builtins := getModels().Deveco
+	if len(builtins) > 0 {
+		return cloneModelInfos(builtins)
+	}
+	// Fallback default models when not defined in models.json
+	return []*ModelInfo{
+		{
+			ID:                 "glm-5",
+			Object:             "model",
+			OwnedBy:            "deveco",
+			Type:               "deveco",
+			DisplayName:        "GLM-5",
+			ContextLength:      202752,
+			MaxCompletionTokens: 131072,
+		},
+		{
+			ID:                 "Qwen2.5-VL-72B",
+			Object:             "model",
+			OwnedBy:            "deveco",
+			Type:               "deveco",
+			DisplayName:        "Qwen2.5-VL-72B",
+			ContextLength:      32768,
+			MaxCompletionTokens: 8192,
+		},
+	}
 }
 
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
