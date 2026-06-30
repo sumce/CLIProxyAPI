@@ -60,117 +60,59 @@ func (e *DevecoExecutor) resolveAuth(auth *coreauth.Auth) string {
 }
 
 // Execute handles non-streaming DevEco API requests.
+// Internally uses the streaming endpoint (/chat/completions) for consistent latency,
+// collects all SSE chunks, and assembles the final response. This avoids the
+// unpredictable latency of Huawei's /no-stream/chat/completions endpoint (2s-90s).
 func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	from := opts.SourceFormat
+	// Execute as streaming internally for consistent upstream latency.
+	streamOpts := opts
+	streamOpts.Stream = true
+	streamResult, err := e.ExecuteStream(ctx, auth, req, streamOpts)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
-
-	originalPayload := opts.OriginalRequest
-	if len(originalPayload) == 0 {
-		originalPayload = req.Payload
-	}
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
-
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return cliproxyexecutor.Response{}, err
-	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	// Avoid duplicate translation when originalPayload == req.Payload (common case)
-	originalTranslated := translated
-	if len(opts.OriginalRequest) > 0 {
-		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
-	}
-	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	reporter.SetTranslatedReasoningEffort(translated, to.String())
-
-	// DevEco non-streaming: /no-stream/chat/completions
-	baseURL := e.resolveAuth(auth)
-	url := strings.TrimSuffix(baseURL, "/") + "/no-stream/chat/completions"
-	body := translated
-	if !opts.Stream {
-		if b, setErr := sjson.SetBytes(body, "stream", false); setErr != nil {
-			log.Warnf("deveco: failed to set stream=false: %v", setErr)
-		} else {
-			body = b
+	var fullBody bytes.Buffer
+	for chunk := range streamResult.Chunks {
+		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, nil, chunk.Payload, nil)
+		if len(out) > 0 {
+			fullBody.Write(out)
 		}
+		reporter.Publish(ctx, helps.ParseOpenAIUsage(chunk.Payload))
 	}
-
-	var httpReq *http.Request
-	httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return cliproxyexecutor.Response{}, err
-	}
-	e.injectHeaders(httpReq, auth)
-	httpReq.Header.Set("Content-Type", "application/json")
-	util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
-
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL: url, Method: http.MethodPost, Headers: httpReq.Header.Clone(),
-		Body: body, Provider: e.Identifier(), AuthID: auth.ID,
-	})
-
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	var httpResp *http.Response
-	httpResp, err = httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
-	}
-	defer httpResp.Body.Close()
-
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		var b []byte
-		b, _ = io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
-	}
-
-	var respBody []byte
-	respBody, err = io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
-	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(respBody))
 	reporter.EnsurePublished(ctx)
-
-	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, respBody, &param)
-	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
+	headers := streamResult.Headers
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	return cliproxyexecutor.Response{Payload: fullBody.Bytes(), Headers: headers}, nil
 }
 
-// ExecuteStream handles streaming DevEco API requests.
-func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+// prepareStreamRequest performs the common request preparation steps for streaming.
+// Returns the translated request body, the requested model, and any error.
+func (e *DevecoExecutor) prepareStreamRequest(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (translated []byte, requestedModel string, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
-
 	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 
 	originalPayload := opts.OriginalRequest
 	if len(originalPayload) == 0 {
 		originalPayload = req.Payload
 	}
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	translated = sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestedModel = helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	// Avoid duplicate translation when originalPayload == req.Payload (common case)
 	originalTranslated := translated
@@ -182,6 +124,22 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 		log.Warnf("deveco: failed to set stream_options.include_usage: %v", setErr)
 	} else {
 		translated = t
+	}
+	return translated, requestedModel, nil
+}
+
+// ExecuteStream handles streaming DevEco API requests.
+func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
+	defer reporter.TrackFailure(ctx, &err)
+
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	to := sdktranslator.FromString("openai")
+
+	translated, _, err := e.prepareStreamRequest(ctx, auth, req, opts)
+	if err != nil {
+		return nil, err
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
