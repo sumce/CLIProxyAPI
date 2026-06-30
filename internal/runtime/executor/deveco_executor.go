@@ -389,6 +389,21 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 			if maxOut <= 0 {
 				maxOut = 131072
 			}
+			thinking := parseDevecoThinkingMode(mc.ThinkingMode)
+			// If the model is known to support reasoning (GLM-5.1, GLM-5), always enable
+			// thinking regardless of API thinking_mode value.
+			if thinking == nil {
+				switch mc.ModelID {
+				case "GLM-5.1", "GLM-5", "glm-5.1", "glm-5":
+					thinking = &registry.ThinkingSupport{
+						Min:            0,
+						Max:            8192,
+						ZeroAllowed:    true,
+						DynamicAllowed: true,
+						Levels:         []string{"low", "medium", "high"},
+					}
+				}
+			}
 			models = append(models, &registry.ModelInfo{
 				ID:                 mc.ModelID,
 				Object:             "model",
@@ -397,7 +412,7 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 				DisplayName:        mc.ModelID,
 				ContextLength:      ctxLen,
 				MaxCompletionTokens: maxOut,
-				Thinking:           parseDevecoThinkingMode(mc.ThinkingMode),
+				Thinking:           thinking,
 			})
 		}
 	}
