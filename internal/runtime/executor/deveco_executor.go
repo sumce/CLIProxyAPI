@@ -152,7 +152,7 @@ func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req c
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	e.injectHeaders(httpReq, auth)
+	e.injectHeaders(httpReq, auth, opts.Headers)
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Cache-Control", "no-cache")
@@ -286,7 +286,7 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 	if err != nil {
 		return nil, err
 	}
-	e.injectHeaders(httpReq, auth)
+	e.injectHeaders(httpReq, auth, opts.Headers)
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Cache-Control", "no-cache")
@@ -379,7 +379,7 @@ func (e *DevecoExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, r
 	if req == nil {
 		return nil, fmt.Errorf("deveco: request is nil")
 	}
-	e.injectHeaders(req, auth)
+	e.injectHeaders(req, auth, nil)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(req)
 }
@@ -423,7 +423,7 @@ func (e *DevecoExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*cor
 	return auth, nil
 }
 
-func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth) {
+func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth, clientHeaders http.Header) {
 	if req == nil || auth == nil {
 		return
 	}
@@ -436,15 +436,16 @@ func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth) {
 	if req.Header.Get("Chat-Id") == "" {
 		req.Header.Set("Chat-Id", newChatID())
 	}
-	// 如果原始请求带有会话标识，转发给上游
-	if sessionID := req.Header.Get("x-deveco-session"); sessionID != "" {
-		if req.Header.Get("Session-Id") == "" {
-			req.Header.Set("Session-Id", sessionID)
-		}
-	}
-	if sessionID := req.Header.Get("x-session-affinity"); sessionID != "" {
-		if req.Header.Get("Session-Id") == "" {
-			req.Header.Set("Session-Id", sessionID)
+	// Propagate DevEco session affinity from incoming client headers.
+	// The client (e.g. DevEco Code IDE plugin) may send x-deveco-session
+	// or x-session-affinity to maintain conversation context.
+	if req.Header.Get("Session-Id") == "" {
+		if clientHeaders != nil {
+			if sessionID := clientHeaders.Get("x-deveco-session"); sessionID != "" {
+				req.Header.Set("Session-Id", sessionID)
+			} else if sessionID := clientHeaders.Get("x-session-affinity"); sessionID != "" {
+				req.Header.Set("Session-Id", sessionID)
+			}
 		}
 	}
 }

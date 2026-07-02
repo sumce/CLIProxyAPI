@@ -59,3 +59,4 @@ _bmad-output/*
 
 # Local auth files
 auths/*.json
+cli-proxy-api*

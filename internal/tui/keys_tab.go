@@ -101,7 +101,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			m.codex = msg.codex
 			m.vertex = msg.vertex
 			m.openai = msg.openai
-				m.deveco = msg.deveco
+			m.deveco = msg.deveco
 			if m.cursor >= len(m.keys) {
 				m.cursor = max(0, len(m.keys)-1)
 			}
