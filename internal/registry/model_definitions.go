@@ -121,7 +121,7 @@ func GetDevecoModels() []*ModelInfo {
 	// Fallback default models when not defined in models.json
 	return []*ModelInfo{
 		{
-			ID:                  "glm-5.1",
+			ID:                  "GLM-5.1",
 			Object:              "model",
 			OwnedBy:             "deveco",
 			Type:                "deveco",
@@ -137,7 +137,7 @@ func GetDevecoModels() []*ModelInfo {
 			},
 		},
 		{
-			ID:                 "glm-5",
+			ID:                 "GLM-5",
 			Object:             "model",
 			OwnedBy:            "deveco",
 			Type:               "deveco",
