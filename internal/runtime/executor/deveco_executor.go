@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/deveco"
@@ -125,6 +126,11 @@ func (a *aggregatedDelta) toCompleteResponse() []byte {
 // Internally uses the streaming endpoint (/chat/completions) for consistent latency,
 // collects all SSE chunks, and assembles the final response. This avoids the
 // unpredictable latency of Huawei's /no-stream/chat/completions endpoint (2s-90s).
+//
+// Note: deveco-code (official IDE) rewrites the URL to /no-stream/chat/completions
+// and sets stream=false for non-streaming requests. CLIProxyAPI intentionally uses
+// the streaming path + aggregation instead, which produces the same result with
+// more predictable latency.
 //
 // Unlike the streaming path, this method aggregates all streaming delta chunks
 // into a single complete chat-completions response before calling TranslateNonStream.
@@ -254,6 +260,10 @@ func (e *DevecoExecutor) prepareStreamRequest(ctx context.Context, auth *coreaut
 		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	}
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// Ensure the body model ID matches the resolved base model (strip suffixes like :thinking).
+	if m, setErr := sjson.SetBytes(translated, "model", baseModel); setErr == nil {
+		translated = m
+	}
 	if t, setErr := sjson.SetBytes(translated, "stream_options.include_usage", true); setErr != nil {
 		log.Warnf("deveco: failed to set stream_options.include_usage: %v", setErr)
 	} else {
@@ -433,9 +443,7 @@ func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth, c
 	if req.Header.Get("lang") == "" {
 		req.Header.Set("lang", "en")
 	}
-	if req.Header.Get("Chat-Id") == "" {
-		req.Header.Set("Chat-Id", newChatID())
-	}
+
 	// Propagate DevEco session affinity from incoming client headers.
 	// The client (e.g. DevEco Code IDE plugin) may send x-deveco-session
 	// or x-session-affinity to maintain conversation context.
@@ -448,6 +456,45 @@ func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth, c
 			}
 		}
 	}
+
+	// Forward x-deveco-* headers from client to upstream for request tracking.
+	if clientHeaders != nil {
+		for _, h := range []string{"x-deveco-session", "x-deveco-request", "x-deveco-client", "x-deveco-project"} {
+			if v := clientHeaders.Get(h); v != "" && req.Header.Get(h) == "" {
+				req.Header.Set(h, v)
+			}
+		}
+	}
+
+	// Set or forward User-Agent.
+	if req.Header.Get("User-Agent") == "" {
+		if clientHeaders != nil {
+			if ua := clientHeaders.Get("User-Agent"); ua != "" {
+				req.Header.Set("User-Agent", ua)
+			}
+		}
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", "CLIProxyAPI")
+		}
+	}
+
+	// Stable Chat-Id per session (matching deveco-code behavior).
+	sessionID := req.Header.Get("Session-Id")
+	if sessionID != "" {
+		if cached, ok := devecoSessionChatID.Load(sessionID); ok {
+			if id, ok := cached.(string); ok && id != "" {
+				req.Header.Set("Chat-Id", id)
+				return
+			}
+		}
+	}
+	if req.Header.Get("Chat-Id") == "" {
+		chatID := newChatID()
+		req.Header.Set("Chat-Id", chatID)
+		if sessionID != "" {
+			devecoSessionChatID.Store(sessionID, chatID)
+		}
+	}
 }
 
 func extractAccessToken(auth *coreauth.Auth) string {
@@ -457,6 +504,10 @@ func extractAccessToken(auth *coreauth.Auth) string {
 	token, _ := auth.Metadata["access_token"].(string)
 	return token
 }
+
+// devecoSessionChatID caches stable Chat-Id values by Session-Id, matching
+// deveco-code's sessionChatIdMap pattern for conversation continuity.
+var devecoSessionChatID sync.Map
 
 func newChatID() string {
 	b := make([]byte, 16)
