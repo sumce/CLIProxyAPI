@@ -198,10 +198,15 @@ func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req c
 			reporter.Publish(ctx, detail)
 		}
 	}
+	var scanErr error
 	if errScan := scanner.Err(); errScan != nil {
 		log.Errorf("deveco: stream read error for auth %s: %v", auth.ID, errScan)
+		scanErr = errScan
 	}
 	reporter.EnsurePublished(ctx)
+	if scanErr != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("deveco: stream read error: %w", scanErr)
+	}
 
 	// Translate the complete aggregated response once.
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -430,6 +435,17 @@ func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth) {
 	}
 	if req.Header.Get("Chat-Id") == "" {
 		req.Header.Set("Chat-Id", newChatID())
+	}
+	// 如果原始请求带有会话标识，转发给上游
+	if sessionID := req.Header.Get("x-deveco-session"); sessionID != "" {
+		if req.Header.Get("Session-Id") == "" {
+			req.Header.Set("Session-Id", sessionID)
+		}
+	}
+	if sessionID := req.Header.Get("x-session-affinity"); sessionID != "" {
+		if req.Header.Get("Session-Id") == "" {
+			req.Header.Set("Session-Id", sessionID)
+		}
 	}
 }
 

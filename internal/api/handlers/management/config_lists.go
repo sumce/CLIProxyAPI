@@ -742,6 +742,13 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 	c.JSON(400, gin.H{"error": "missing api-key or index"})
 }
 
+// deveco: []DevecoConfig
+func (h *Handler) GetDeveco(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c.JSON(200, gin.H{"deveco": h.cfg.Deveco})
+}
+
 // oauth-excluded-models: map[string][]string
 func (h *Handler) GetOAuthExcludedModels(c *gin.Context) {
 	c.JSON(200, gin.H{"oauth-excluded-models": config.NormalizeOAuthExcludedModels(h.cfg.OAuthExcludedModels)})

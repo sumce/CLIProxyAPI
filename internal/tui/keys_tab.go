@@ -21,6 +21,7 @@ type keysTabModel struct {
 	codex    []map[string]any
 	vertex   []map[string]any
 	openai   []map[string]any
+	deveco   []map[string]any
 	err      error
 	width    int
 	height   int
@@ -43,6 +44,7 @@ type keysDataMsg struct {
 	codex   []map[string]any
 	vertex  []map[string]any
 	openai  []map[string]any
+	deveco  []map[string]any
 	err     error
 }
 
@@ -79,6 +81,7 @@ func (m keysTabModel) fetchKeys() tea.Msg {
 	result.codex, _ = m.client.GetCodexKeys()
 	result.vertex, _ = m.client.GetVertexKeys()
 	result.openai, _ = m.client.GetOpenAICompat()
+	result.deveco, _ = m.client.GetDeveco()
 	return result
 }
 
@@ -98,6 +101,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			m.codex = msg.codex
 			m.vertex = msg.vertex
 			m.openai = msg.openai
+				m.deveco = msg.deveco
 			if m.cursor >= len(m.keys) {
 				m.cursor = max(0, len(m.keys)-1)
 			}
@@ -356,6 +360,30 @@ func (m keysTabModel) renderContent() string {
 			}
 			if baseURL != "" {
 				info += " → " + baseURL
+			}
+			sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, info))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(m.deveco) > 0 {
+		renderSection(&sb, "DevEco", len(m.deveco))
+		for i, entry := range m.deveco {
+			enabled := getBool(entry, "enabled")
+			prefix := getString(entry, "prefix")
+			callbackPort := getString(entry, "callback-port")
+			statusIcon := "○"
+			if enabled {
+				statusIcon = "●"
+			}
+			info := fmt.Sprintf("%s ", statusIcon)
+			if prefix != "" {
+				info += "prefix: " + prefix
+				if callbackPort != "" && callbackPort != "0" {
+					info += fmt.Sprintf(" (port: %s)", callbackPort)
+				}
+			} else {
+				info += fmt.Sprintf("port: %s", callbackPort)
 			}
 			sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, info))
 		}

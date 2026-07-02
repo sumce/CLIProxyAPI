@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/browser"
@@ -39,8 +40,10 @@ var devecoRefreshGroup singleflight.Group
 
 // DevecoAuth handles the DevEco OAuth authentication flow.
 type DevecoAuth struct {
-	httpClient *http.Client
-	cfg        *config.Config
+	httpClient          *http.Client
+	cfg                 *config.Config
+	lastRefreshFailedAt time.Time
+	mu                  sync.Mutex
 }
 
 // NewDevecoAuth creates a new DevEco auth service.
@@ -144,11 +147,23 @@ func (d *DevecoAuth) Login(ctx context.Context, callbackPort int) (*LoginResult,
 
 // RefreshToken refreshes the DevEco access token using the JWT.
 func (d *DevecoAuth) RefreshToken(ctx context.Context, jwtToken string) (*LoginResult, error) {
+	// Cooldown check: skip refresh for 30 seconds after a failure
+	d.mu.Lock()
+	cooldownActive := !d.lastRefreshFailedAt.IsZero() && time.Since(d.lastRefreshFailedAt) < 30*time.Second
+	d.mu.Unlock()
+	if cooldownActive {
+		log.Warn("deveco refresh: skipping, in cooldown after recent failure")
+		return nil, fmt.Errorf("deveco refresh: cooldown active")
+	}
+
 	key := "deveco-refresh:" + jwtToken
 	result, err, _ := devecoRefreshGroup.Do(key, func() (interface{}, error) {
 		return d.refreshTokenCall(ctx, jwtToken)
 	})
 	if err != nil {
+		d.mu.Lock()
+		d.lastRefreshFailedAt = time.Now()
+		d.mu.Unlock()
 		return nil, err
 	}
 	return result.(*LoginResult), nil

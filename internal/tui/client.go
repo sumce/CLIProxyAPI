@@ -310,6 +310,11 @@ func (c *Client) GetOpenAICompat() ([]map[string]any, error) {
 	return c.getWrappedKeyList("/v0/management/openai-compatibility", "openai-compatibility")
 }
 
+// GetDeveco fetches DevEco config entries.
+func (c *Client) GetDeveco() ([]map[string]any, error) {
+	return c.getWrappedKeyList("/v0/management/deveco", "deveco")
+}
+
 // getWrappedKeyList fetches a wrapped list from the API.
 func (c *Client) getWrappedKeyList(path, key string) ([]map[string]any, error) {
 	wrapper, err := c.getJSON(path)
