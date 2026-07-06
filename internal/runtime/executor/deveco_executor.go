@@ -31,6 +31,14 @@ import (
 // modelAPIURL is the Huawei API endpoint for fetching available models.
 const modelAPIURL = deveco.DevEcoBaseURL + "/codeGenie/modelConfig"
 
+// devecoUserAgent mimics DevEco Code IDE's User-Agent to avoid fingerprint detection.
+// DevEco Code sends "deveco/{InstallationVersion}".
+const devecoUserAgent = "deveco/1.0.0"
+
+// devecoSessionIDCache stores stable session UUIDs per auth ID, matching
+// DevEco Code's behavior of sending a consistent x-deveco-session across requests.
+var devecoSessionIDCache sync.Map // auth.ID → stable session UUID
+
 // DevecoExecutor implements ProviderExecutor for Huawei DevEco Code's MaaS API.
 type DevecoExecutor struct {
 	provider   string
@@ -165,26 +173,15 @@ func stripEmptyReasoningContent(payload []byte) []byte {
 }
 
 // Execute handles non-streaming DevEco API requests.
-// Internally uses the streaming endpoint (/chat/completions) for consistent latency,
-// collects all SSE chunks, and assembles the final response. This avoids the
-// unpredictable latency of Huawei's /no-stream/chat/completions endpoint (2s-90s).
-//
-// Note: deveco-code (official IDE) rewrites the URL to /no-stream/chat/completions
-// and sets stream=false for non-streaming requests. CLIProxyAPI intentionally uses
-// the streaming path + aggregation instead, which produces the same result with
-// more predictable latency.
-//
-// Unlike the streaming path, this method aggregates all streaming delta chunks
-// into a single complete chat-completions response before calling TranslateNonStream.
-// This is necessary because TranslateNonStream expects complete message format
-// (choices[0].message.reasoning_content), not streaming delta format (choices[0].delta.reasoning_content).
+// Uses the /no-stream/chat/completions endpoint with stream:false, matching
+// DevEco Code IDE's behavior exactly to avoid fingerprint detection.
 func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	// Prepare request body (same as ExecuteStream)
-	translated, _, errPrepare := e.prepareStreamRequest(ctx, auth, req, opts)
+	// Prepare request body with streaming=false (matches DevEco Code non-streaming behavior).
+	translated, _, errPrepare := e.prepareRequest(ctx, auth, req, opts, false)
 	if errPrepare != nil {
 		err = errPrepare
 		return cliproxyexecutor.Response{}, err
@@ -193,7 +190,9 @@ func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req c
 	to := sdktranslator.FromString("openai")
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	baseURL := e.resolveAuth(auth)
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	// DevEco Code rewrites /chat/completions → /no-stream/chat/completions for
+	// non-streaming requests. Match this exactly.
+	url := strings.TrimSuffix(baseURL, "/") + "/no-stream/chat/completions"
 
 	var httpReq *http.Request
 	httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -202,8 +201,6 @@ func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req c
 	}
 	e.injectHeaders(httpReq, auth, opts.Headers)
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
 	util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
 
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
@@ -227,55 +224,43 @@ func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req c
 		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 
-	// Read SSE stream and aggregate all delta chunks into a complete response.
-	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800)
-	var delta aggregatedDelta
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			continue
+	// Read JSON response body directly (non-streaming endpoint returns JSON, not SSE).
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("deveco: read response: %w", err)
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+
+	// Check for error in response body.
+	if errField := gjson.GetBytes(body, "error"); errField.Exists() && errField.IsObject() {
+		errMsg := errField.Get("message").String()
+		if errMsg == "" {
+			errMsg = "upstream error"
 		}
-		if !bytes.HasPrefix(trimmed, []byte("data:")) {
-			continue
-		}
-		delta.ingest(trimmed)
-		if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
+		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: errMsg}
+	}
+
+	// Extract usage from non-streaming JSON response.
+	if usage := gjson.GetBytes(body, "usage"); usage.Exists() && usage.IsObject() {
+		if detail, ok := helps.ParseOpenAIStreamUsage(append([]byte("data: "), body...)); ok {
 			reporter.Publish(ctx, detail)
 		}
 	}
-	var scanErr error
-	if errScan := scanner.Err(); errScan != nil {
-		log.Errorf("deveco: stream read error for auth %s: %v", auth.ID, errScan)
-		scanErr = errScan
-	}
 	reporter.EnsurePublished(ctx)
-	if scanErr != nil {
-		return cliproxyexecutor.Response{}, fmt.Errorf("deveco: stream read error: %w", scanErr)
-	}
 
-	// Check for SSE-level error (e.g. Huawei sends event: error + data: {"error":...}).
-	if delta.hasError() {
-		code := delta.ErrCode
-		if code == 0 {
-			code = http.StatusBadGateway
-		}
-		return cliproxyexecutor.Response{}, statusErr{code: code, msg: delta.ErrMessage}
-	}
-
-	// Translate the complete aggregated response once.
+	// Translate the complete JSON response.
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, delta.toCompleteResponse(), &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, body, &param)
 
 	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 }
 
-// prepareStreamRequest performs the common request preparation steps for streaming.
+// prepareRequest performs the common request preparation steps for both streaming
+// and non-streaming requests. The streaming parameter controls the stream field
+// and stream_options in the request body, matching DevEco Code's behavior.
 // Returns the translated request body, the requested model, and any error.
-func (e *DevecoExecutor) prepareStreamRequest(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (translated []byte, requestedModel string, err error) {
+func (e *DevecoExecutor) prepareRequest(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, streaming bool) (translated []byte, requestedModel string, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
@@ -315,17 +300,22 @@ func (e *DevecoExecutor) prepareStreamRequest(ctx context.Context, auth *coreaut
 	if m, setErr := sjson.SetBytes(translated, "model", baseModel); setErr == nil {
 		translated = m
 	}
-	// Huawei's DevEco MaaS API rejects stream=false with:
-	//   "Stream Chat request for Model Service error: argument stream is false"
-	// Always force stream=true, even for non-streaming Execute() which aggregates
-	// the SSE chunks internally.
-	if s, setErr := sjson.SetBytes(translated, "stream", true); setErr == nil {
-		translated = s
-	}
-	if t, setErr := sjson.SetBytes(translated, "stream_options.include_usage", true); setErr != nil {
-		log.Warnf("deveco: failed to set stream_options.include_usage: %v", setErr)
+	// Set stream field based on mode:
+	// - Streaming: stream=true + stream_options.include_usage (matches DevEco Code streaming)
+	// - Non-streaming: stream=false (matches DevEco Code non-streaming, used with /no-stream/ path)
+	if streaming {
+		if s, setErr := sjson.SetBytes(translated, "stream", true); setErr == nil {
+			translated = s
+		}
+		if t, setErr := sjson.SetBytes(translated, "stream_options.include_usage", true); setErr != nil {
+			log.Warnf("deveco: failed to set stream_options.include_usage: %v", setErr)
+		} else {
+			translated = t
+		}
 	} else {
-		translated = t
+		if s, setErr := sjson.SetBytes(translated, "stream", false); setErr == nil {
+			translated = s
+		}
 	}
 	return translated, requestedModel, nil
 }
@@ -339,7 +329,7 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 
-	translated, _, err := e.prepareStreamRequest(ctx, auth, req, opts)
+	translated, _, err := e.prepareRequest(ctx, auth, req, opts, true)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +347,6 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 	e.injectHeaders(httpReq, auth, opts.Headers)
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
 	util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
 
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
@@ -526,37 +515,61 @@ func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth, c
 		req.Header.Set("lang", "en")
 	}
 
-	// Propagate DevEco session affinity from incoming client headers.
-	// The client (e.g. DevEco Code IDE plugin) may send x-deveco-session
-	// or x-session-affinity to maintain conversation context.
-	if req.Header.Get("Session-Id") == "" {
-		if clientHeaders != nil {
-			if sessionID := clientHeaders.Get("x-deveco-session"); sessionID != "" {
-				req.Header.Set("Session-Id", sessionID)
-			} else if sessionID := clientHeaders.Get("x-session-affinity"); sessionID != "" {
-				req.Header.Set("Session-Id", sessionID)
-			}
-		}
-	}
-
-	// Forward x-deveco-* headers from client to upstream for request tracking.
-	if clientHeaders != nil {
-		for _, h := range []string{"x-deveco-session", "x-deveco-request", "x-deveco-client", "x-deveco-project"} {
-			if v := clientHeaders.Get(h); v != "" && req.Header.Get(h) == "" {
-				req.Header.Set(h, v)
-			}
-		}
-	}
-
-	// Set or forward User-Agent.
+	// User-Agent: DevEco Code sends "deveco/{version}". Match this exactly;
+	// only forward client UA if it already looks like a deveco agent.
 	if req.Header.Get("User-Agent") == "" {
+		ua := devecoUserAgent
 		if clientHeaders != nil {
-			if ua := clientHeaders.Get("User-Agent"); ua != "" {
-				req.Header.Set("User-Agent", ua)
+			if cua := clientHeaders.Get("User-Agent"); strings.HasPrefix(strings.ToLower(cua), "deveco/") {
+				ua = cua
 			}
 		}
-		if req.Header.Get("User-Agent") == "" {
-			req.Header.Set("User-Agent", "CLIProxyAPI")
+		req.Header.Set("User-Agent", ua)
+	}
+
+	// x-deveco-session: DevEco Code always sends this. Generate a stable
+	// session ID per auth if the client doesn't provide one.
+	if req.Header.Get("x-deveco-session") == "" && clientHeaders != nil {
+		if v := clientHeaders.Get("x-deveco-session"); v != "" {
+			req.Header.Set("x-deveco-session", v)
+		} else if v := clientHeaders.Get("x-session-affinity"); v != "" {
+			req.Header.Set("x-deveco-session", v)
+		}
+	}
+	if req.Header.Get("x-deveco-session") == "" {
+		req.Header.Set("x-deveco-session", getOrCreateDevecoSessionID(auth.ID))
+	}
+
+	// Session-Id: same value as x-deveco-session (matching DevEco Code).
+	if req.Header.Get("Session-Id") == "" {
+		req.Header.Set("Session-Id", req.Header.Get("x-deveco-session"))
+	}
+
+	// x-deveco-request: DevEco Code sends the user ID. Generate a unique
+	// ID per request if the client doesn't provide one.
+	if req.Header.Get("x-deveco-request") == "" && clientHeaders != nil {
+		if v := clientHeaders.Get("x-deveco-request"); v != "" {
+			req.Header.Set("x-deveco-request", v)
+		}
+	}
+	if req.Header.Get("x-deveco-request") == "" {
+		req.Header.Set("x-deveco-request", newChatID())
+	}
+
+	// x-deveco-client: DevEco Code sends the client type (e.g., "cli", "tui").
+	if req.Header.Get("x-deveco-client") == "" && clientHeaders != nil {
+		if v := clientHeaders.Get("x-deveco-client"); v != "" {
+			req.Header.Set("x-deveco-client", v)
+		}
+	}
+	if req.Header.Get("x-deveco-client") == "" {
+		req.Header.Set("x-deveco-client", "cli")
+	}
+
+	// x-deveco-project: optional, only forward if client provides it.
+	if req.Header.Get("x-deveco-project") == "" && clientHeaders != nil {
+		if v := clientHeaders.Get("x-deveco-project"); v != "" {
+			req.Header.Set("x-deveco-project", v)
 		}
 	}
 
@@ -577,6 +590,19 @@ func (e *DevecoExecutor) injectHeaders(req *http.Request, auth *coreauth.Auth, c
 			devecoSessionChatID.Store(sessionID, chatID)
 		}
 	}
+}
+
+// getOrCreateDevecoSessionID returns a stable session UUID per auth ID,
+// matching DevEco Code's behavior of sending a consistent session ID.
+func getOrCreateDevecoSessionID(authID string) string {
+	if v, ok := devecoSessionIDCache.Load(authID); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	sessionID := newChatID() // 32-char hex UUID without hyphens (matches crypto.randomUUID().replace(/-/g, ""))
+	devecoSessionIDCache.Store(authID, sessionID)
+	return sessionID
 }
 
 func extractAccessToken(auth *coreauth.Auth) string {
