@@ -5594,10 +5594,16 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		updated.Runtime = auth.Runtime
 	}
 	updated.LastRefreshedAt = now
+	// Preserve the cooldown set by the executor's Refresh method (e.g. deveco sets 25 min).
+	// Only clear it if the executor didn't set one, then check shouldRefresh as fallback.
+	executorCooldown := updated.NextRefreshAfter
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
-	if m.shouldRefresh(updated, now) {
+	if !executorCooldown.IsZero() && now.Before(executorCooldown) {
+		// Executor set a valid cooldown; respect it to avoid tight refresh loops.
+		updated.NextRefreshAfter = executorCooldown
+	} else if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
 	_, _ = m.Update(ctx, updated)
