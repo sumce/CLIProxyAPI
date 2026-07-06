@@ -749,6 +749,94 @@ func (h *Handler) GetDeveco(c *gin.Context) {
 	c.JSON(200, gin.H{"deveco": h.cfg.Deveco})
 }
 
+func (h *Handler) PutDeveco(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var arr []config.DevecoConfig
+	if err := json.Unmarshal(data, &arr); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.Deveco = arr
+	h.cfg.SanitizeDevecoKeys()
+	h.persistLocked(c)
+}
+
+type devecoConfigPatch struct {
+	Enabled       *bool   `json:"enabled"`
+	Prefix        *string `json:"prefix"`
+	CallbackPort  *int    `json:"callback-port"`
+	DisableCooling *bool  `json:"disable-cooling"`
+}
+
+func (h *Handler) PatchDeveco(c *gin.Context) {
+	var body struct {
+		Index *int               `json:"index"`
+		Match *string            `json:"match"`
+		Value *devecoConfigPatch `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	idx := h.resolveDevecoIndex(body.Index, body.Match)
+	if idx < 0 {
+		c.JSON(400, gin.H{"error": "missing index or match"})
+		return
+	}
+	if body.Value.Enabled != nil {
+		h.cfg.Deveco[idx].Enabled = *body.Value.Enabled
+	}
+	if body.Value.Prefix != nil {
+		h.cfg.Deveco[idx].Prefix = *body.Value.Prefix
+	}
+	if body.Value.CallbackPort != nil {
+		h.cfg.Deveco[idx].CallbackPort = *body.Value.CallbackPort
+	}
+	if body.Value.DisableCooling != nil {
+		h.cfg.Deveco[idx].DisableCooling = *body.Value.DisableCooling
+	}
+	h.cfg.SanitizeDevecoKeys()
+	h.persistLocked(c)
+}
+
+func (h *Handler) DeleteDeveco(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
+		if errScan == nil && idx >= 0 && idx < len(h.cfg.Deveco) {
+			h.cfg.Deveco = append(h.cfg.Deveco[:idx], h.cfg.Deveco[idx+1:]...)
+			h.cfg.SanitizeDevecoKeys()
+			h.persistLocked(c)
+			return
+		}
+	}
+	c.JSON(400, gin.H{"error": "missing index"})
+}
+
+func (h *Handler) resolveDevecoIndex(idx *int, match *string) int {
+	if idx != nil && *idx >= 0 && *idx < len(h.cfg.Deveco) {
+		return *idx
+	}
+	if match != nil {
+		for i := range h.cfg.Deveco {
+			if h.cfg.Deveco[i].Prefix == *match {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // oauth-excluded-models: map[string][]string
 func (h *Handler) GetOAuthExcludedModels(c *gin.Context) {
 	c.JSON(200, gin.H{"oauth-excluded-models": config.NormalizeOAuthExcludedModels(h.cfg.OAuthExcludedModels)})

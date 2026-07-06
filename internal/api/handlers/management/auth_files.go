@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/deveco"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -2525,6 +2526,139 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) RequestDevecoToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	fmt.Println("Initializing DevEco Code authentication...")
+
+	state := fmt.Sprintf("dvc-%d", time.Now().UnixNano())
+
+	// Determine callback port from config or use default.
+	callbackPort := deveco.DefaultCallbackPort
+	h.mu.Lock()
+	if len(h.cfg.Deveco) > 0 && h.cfg.Deveco[0].CallbackPort > 0 {
+		callbackPort = h.cfg.Deveco[0].CallbackPort
+	}
+	cfg := h.cfg
+	h.mu.Unlock()
+
+	authSvc := deveco.NewDevecoAuth(cfg)
+
+	// Generate clientSecret and find an available port.
+	clientSecret, errSecret := deveco.GenerateClientSecret()
+	if errSecret != nil {
+		log.Errorf("Failed to generate DevEco client secret: %v", errSecret)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate client secret"})
+		return
+	}
+
+	port, errPort := deveco.FindAvailablePort(callbackPort)
+	if errPort != nil {
+		log.Errorf("Failed to find available port for DevEco callback: %v", errPort)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "no available port for callback server"})
+		return
+	}
+
+	// Start callback server.
+	cbServer := deveco.NewCallbackServer(port, clientSecret, deveco.DevEcoBaseURL, deveco.SuccessRedirectURL, deveco.FailedRedirectURL)
+	if errStart := cbServer.Start(); errStart != nil {
+		log.Errorf("Failed to start DevEco callback server: %v", errStart)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
+		return
+	}
+
+	// Build login URL.
+	loginURL := fmt.Sprintf("%s/%s?port=%d&appid=%s&code=%s",
+		deveco.DevEcoBaseURL, deveco.AuthURL, port, deveco.AppID, clientSecret)
+
+	RegisterOAuthSession(state, "deveco")
+
+	go func() {
+		defer func() {
+			if errStop := cbServer.Stop(); errStop != nil {
+				log.Errorf("Failed to stop DevEco callback server: %v", errStop)
+			}
+		}()
+
+		fmt.Println("Waiting for DevEco authentication...")
+
+		callbackCtx, cancel := context.WithTimeout(ctx, deveco.LoginTimeout)
+		defer cancel()
+
+		callback, errWait := cbServer.WaitForCallback(callbackCtx, deveco.LoginTimeout)
+		if errWait != nil {
+			errMsg := errWait.Error()
+			if strings.Contains(errMsg, "cancelled") {
+				SetOAuthSessionError(state, "Login cancelled by user")
+			} else {
+				SetOAuthSessionError(state, "Authentication timeout")
+			}
+			fmt.Printf("DevEco authentication failed: %v\n", errWait)
+			return
+		}
+
+		result, errLogin := authSvc.LoginWithCallback(callbackCtx, callback)
+		if errLogin != nil {
+			errMsg := errLogin.Error()
+			if strings.Contains(errMsg, "unsupported region") {
+				SetOAuthSessionError(state, "Only China site accounts are supported")
+			} else {
+				SetOAuthSessionError(state, "Authentication failed")
+			}
+			fmt.Printf("DevEco authentication failed: %v\n", errLogin)
+			return
+		}
+
+		fileName := deveco.CredentialFileName(result.UserName, result.UserID)
+		now := time.Now()
+		expiresAt := now.Add(30 * time.Minute)
+		if result.ExpiresAt > 0 {
+			expiresAt = time.Unix(result.ExpiresAt, 0)
+		}
+
+		tokenStorage := &deveco.DevecoTokenStorage{
+			AccessToken:  result.AccessToken,
+			RefreshToken: result.RefreshToken,
+			JWTToken:     result.JWTToken,
+			TokenType:    "Bearer",
+			Expired:      expiresAt.UTC().Format(time.RFC3339),
+			Email:        result.UserName,
+			UserID:       result.UserID,
+			BaseURL:      deveco.DevEcoBaseURL,
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "deveco",
+			FileName: fileName,
+			Label:    fmt.Sprintf("DevEco - %s", result.UserName),
+			Storage:  tokenStorage,
+			Metadata: map[string]any{
+				"access_token":  result.AccessToken,
+				"refresh_token": result.RefreshToken,
+				"jwt_token":     result.JWTToken,
+				"expires_at":    float64(expiresAt.Unix()),
+				"user_id":       result.UserID,
+				"user_name":     result.UserName,
+				"type":          "deveco",
+			},
+		}
+
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save DevEco token to file: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save token to file")
+			return
+		}
+
+		CompleteOAuthSession(state)
+		fmt.Printf("DevEco authentication successful! Token saved to %s\n", savedPath)
+	}()
+
+	c.JSON(200, gin.H{"status": "ok", "url": loginURL, "state": state})
 }
 
 func (h *Handler) GetAuthStatus(c *gin.Context) {

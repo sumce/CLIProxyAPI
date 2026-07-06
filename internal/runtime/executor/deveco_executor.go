@@ -63,6 +63,7 @@ func (e *DevecoExecutor) resolveAuth(auth *coreauth.Auth) string {
 
 // aggregatedDelta accumulates content and reasoning_content from streaming
 // SSE delta chunks into a single complete chat-completions response.
+// It also detects SSE-level error events (event: error + data: {"error":...}).
 type aggregatedDelta struct {
 	ID               string
 	Model            string
@@ -70,11 +71,26 @@ type aggregatedDelta struct {
 	Content          strings.Builder
 	ReasoningContent strings.Builder
 	Usage            json.RawMessage
+	ErrMessage       string // non-empty if an SSE error was received
+	ErrCode          int    // HTTP-like code from SSE error (0 if absent)
 }
 
 func (a *aggregatedDelta) ingest(line []byte) {
 	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return
+	}
+	// Detect SSE-level error payloads (Huawei sends event: error + data: {"error":{...}}).
+	if errField := gjson.GetBytes(payload, "error"); errField.Exists() && errField.IsObject() {
+		if msg := errField.Get("message").String(); msg != "" {
+			a.ErrMessage = msg
+		}
+		if code := errField.Get("code").String(); code != "" {
+			var c int
+			if _, err := fmt.Sscanf(code, "%d", &c); err == nil {
+				a.ErrCode = c
+			}
+		}
 		return
 	}
 	if id := gjson.GetBytes(payload, "id").String(); id != "" {
@@ -97,6 +113,11 @@ func (a *aggregatedDelta) ingest(line []byte) {
 	if usage := gjson.GetBytes(payload, "usage"); usage.Exists() && usage.IsObject() {
 		a.Usage = json.RawMessage(usage.Raw)
 	}
+}
+
+// hasError returns true if an SSE error was ingested.
+func (a *aggregatedDelta) hasError() bool {
+	return a.ErrMessage != ""
 }
 
 func (a *aggregatedDelta) toCompleteResponse() []byte {
@@ -214,6 +235,15 @@ func (e *DevecoExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req c
 		return cliproxyexecutor.Response{}, fmt.Errorf("deveco: stream read error: %w", scanErr)
 	}
 
+	// Check for SSE-level error (e.g. Huawei sends event: error + data: {"error":...}).
+	if delta.hasError() {
+		code := delta.ErrCode
+		if code == 0 {
+			code = http.StatusBadGateway
+		}
+		return cliproxyexecutor.Response{}, statusErr{code: code, msg: delta.ErrMessage}
+	}
+
 	// Translate the complete aggregated response once.
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	var param any
@@ -263,6 +293,13 @@ func (e *DevecoExecutor) prepareStreamRequest(ctx context.Context, auth *coreaut
 	// Ensure the body model ID matches the resolved base model (strip suffixes like :thinking).
 	if m, setErr := sjson.SetBytes(translated, "model", baseModel); setErr == nil {
 		translated = m
+	}
+	// Huawei's DevEco MaaS API rejects stream=false with:
+	//   "Stream Chat request for Model Service error: argument stream is false"
+	// Always force stream=true, even for non-streaming Execute() which aggregates
+	// the SSE chunks internally.
+	if s, setErr := sjson.SetBytes(translated, "stream", true); setErr == nil {
+		translated = s
 	}
 	if t, setErr := sjson.SetBytes(translated, "stream_options.include_usage", true); setErr != nil {
 		log.Warnf("deveco: failed to set stream_options.include_usage: %v", setErr)
@@ -347,6 +384,22 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 					continue
 				}
 				continue
+			}
+			// Detect SSE-level error payloads and emit them directly.
+			payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
+			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+				if errField := gjson.GetBytes(payload, "error"); errField.Exists() && errField.IsObject() {
+					errMsg := errField.Get("message").String()
+					if errMsg == "" {
+						errMsg = "upstream error"
+					}
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: []byte(fmt.Sprintf(`data: {"error":{"message":"%s","type":"upstream_error"}}`, errMsg))}:
+					case <-ctx.Done():
+						return
+					}
+					continue
+				}
 			}
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmed), &param)
 			for i := range chunks {
@@ -517,9 +570,39 @@ func newChatID() string {
 	return hex.EncodeToString(b)
 }
 
+// devecoModelCache caches dynamically fetched models + task default model map per auth ID.
+// Matches the TS source's module-level cachedConfig pattern: first successful fetch is cached.
+var (
+	devecoModelCache     sync.Map // auth.ID → []*registry.ModelInfo
+	devecoTaskDefaultMap sync.Map // auth.ID → map[string]string (small_model, ui_verification, blacklist)
+)
+
+// defaultDevecoTaskDefaultMap mirrors the TS source's DEVECO_DEFAULTS.taskDefaultModelMap.
+var defaultDevecoTaskDefaultMap = map[string]string{
+	"small_model":     "glm-5",
+	"ui_verification": "Qwen3_VL_235B_A22B_Instruct",
+	"blacklist":       "Qwen2.5-VL-72B",
+}
+
+// GetDevecoTaskDefaultMap returns the cached task default model map for an auth,
+// or the default map if no dynamic fetch has occurred.
+func GetDevecoTaskDefaultMap(authID string) map[string]string {
+	if v, ok := devecoTaskDefaultMap.Load(authID); ok {
+		if m, ok := v.(map[string]string); ok {
+			return m
+		}
+	}
+	return defaultDevecoTaskDefaultMap
+}
+
 // FetchAndRegisterDevecoModels fetches the latest model list from the Huawei DevEco API
 // and registers them in the global model registry. This enables dynamic model discovery
 // (e.g., GLM-5.1 when it becomes available through the user's account).
+//
+// The response includes a task_default_model_map (small_model, ui_verification, blacklist)
+// which is extracted and cached for routing decisions. Blacklisted models are filtered out
+// from the returned list, matching the TS source's filterBlacklist() behavior.
+//
 // The httpClient should be proxy-aware; use nil to create a default client.
 func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, installationVersion string, httpClient *http.Client) ([]*registry.ModelInfo, error) {
 	url := fmt.Sprintf("%s?localVersion=0&pluginVersion=CLI.%s", modelAPIURL, installationVersion)
@@ -531,7 +614,7 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 	req.Header.Set("Content-Type", "application/json")
 
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 10 * time.Second}
+		httpClient = &http.Client{Timeout: 5 * time.Second}
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -547,58 +630,101 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 		return nil, fmt.Errorf("deveco fetch models: HTTP %d", resp.StatusCode)
 	}
 
-	// Parse the Huawei model config API response.
-	// inner_models and outer_models share the same shape; both are processed so
-	// that models served from either bucket are registered (outer_models is
-	// currently empty but Huawei may populate it).
-	type devecoModelConfig struct {
-		ID              int      `json:"id"`
-		ModelID         string   `json:"model_id"`
-		ThinkingMode    string   `json:"thinking_mode"`
-		InputModalities []string `json:"input_modalities,omitempty"`
-		ContextWindow   int      `json:"context_window,omitempty"`
-		Output          int      `json:"output,omitempty"`
-		ToolCallMode    string   `json:"tool_call_mode"`
-	}
-	type devecoModelGroup struct {
-		Protocol     string              `json:"protocol"`
-		GroupName    string              `json:"group_name"`
-		GroupNameCN  string              `json:"group_name_cn,omitempty"`
-		ModelConfigs []devecoModelConfig `json:"model_configs"`
-	}
-	var apiResp struct {
+	// Parse the raw JSON first to extract task_default_model_map (not in the typed schema,
+	// matching the TS source which reads it from raw JSON to avoid effect schema issues).
+	var raw struct {
 		Code int `json:"code"`
 		Body struct {
-			Version     int                `json:"version"`
-			InnerModels []devecoModelGroup `json:"inner_models"`
-			OuterModels []devecoModelGroup `json:"outer_models"`
+			Version     json.RawMessage `json:"version"`
+			InnerModels []struct {
+				Protocol          string                `json:"protocol"`
+				GroupName         string                `json:"group_name"`
+				GroupNameCN       string                `json:"group_name_cn,omitempty"`
+				TaskDefaultModel  map[string]string     `json:"task_default_model_map,omitempty"`
+				ModelConfigs      []devecoModelConfigRaw `json:"model_configs"`
+			} `json:"inner_models"`
+			OuterModels []struct {
+				Protocol          string                `json:"protocol"`
+				GroupName         string                `json:"group_name"`
+				GroupNameCN       string                `json:"group_name_cn,omitempty"`
+				TaskDefaultModel  map[string]string     `json:"task_default_model_map,omitempty"`
+				ModelConfigs      []devecoModelConfigRaw `json:"model_configs"`
+			} `json:"outer_models"`
 		} `json:"body"`
 	}
-	if err := json.Unmarshal(body, &apiResp); err != nil {
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("deveco fetch models: parse: %w", err)
 	}
-	if apiResp.Code != 200 {
-		return nil, fmt.Errorf("deveco fetch models: API code %d", apiResp.Code)
+	if raw.Code != 200 {
+		return nil, fmt.Errorf("deveco fetch models: API code %d", raw.Code)
 	}
 
+	// Extract task_default_model_map from the first group that has it.
+	taskDefaultMap := defaultDevecoTaskDefaultMap
+	for _, group := range raw.Body.InnerModels {
+		if len(group.TaskDefaultModel) > 0 {
+			taskDefaultMap = group.TaskDefaultModel
+			break
+		}
+	}
+
+	// Build blacklist set from taskDefaultMap.
+	blacklistSet := make(map[string]struct{})
+	if bl, ok := taskDefaultMap["blacklist"]; ok && bl != "" {
+		for _, name := range strings.Split(bl, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				blacklistSet[name] = struct{}{}
+			}
+		}
+	}
+	// Always include the default blacklist entry if not already present.
+	if bl, ok := defaultDevecoTaskDefaultMap["blacklist"]; ok && bl != "" {
+		for _, name := range strings.Split(bl, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				blacklistSet[name] = struct{}{}
+			}
+		}
+	}
+
+	// Collect models from both inner_models and outer_models, deduplicate, and filter blacklist.
 	models := make([]*registry.ModelInfo, 0)
-	groups := append(append([]devecoModelGroup{}, apiResp.Body.InnerModels...), apiResp.Body.OuterModels...)
-	seen := make(map[string]struct{}, len(groups))
-	for _, group := range groups {
+	seen := make(map[string]struct{})
+	allGroups := make([]struct {
+		ModelConfigs []devecoModelConfigRaw
+	}, 0, len(raw.Body.InnerModels)+len(raw.Body.OuterModels))
+	for i := range raw.Body.InnerModels {
+		allGroups = append(allGroups, struct {
+			ModelConfigs []devecoModelConfigRaw
+		}{ModelConfigs: raw.Body.InnerModels[i].ModelConfigs})
+	}
+	for i := range raw.Body.OuterModels {
+		allGroups = append(allGroups, struct {
+			ModelConfigs []devecoModelConfigRaw
+		}{ModelConfigs: raw.Body.OuterModels[i].ModelConfigs})
+	}
+	for _, group := range allGroups {
 		for _, mc := range group.ModelConfigs {
 			if mc.ModelID == "" {
 				continue
 			}
-			// Deduplicate in case a model appears in both buckets.
+			// Deduplicate.
 			if _, dup := seen[mc.ModelID]; dup {
 				continue
 			}
+			// Filter blacklist.
+			if _, blocked := blacklistSet[mc.ModelID]; blocked {
+				log.Debugf("deveco: filtering blacklisted model %s", mc.ModelID)
+				continue
+			}
 			seen[mc.ModelID] = struct{}{}
+
 			ctxLen := mc.ContextWindow
 			if ctxLen <= 0 {
 				ctxLen = 202752
 			}
-			maxOut := mc.Output
+			maxOut := parseDevecoOutputLimit(mc.Output)
 			if maxOut <= 0 {
 				maxOut = 131072
 			}
@@ -629,19 +755,70 @@ func FetchAndRegisterDevecoModels(ctx context.Context, accessToken string, insta
 			})
 		}
 	}
+
+	// Cache the task default model map for later use.
+	// We use a sentinel key "" to store it globally (matching TS module-level cache).
+	devecoTaskDefaultMap.Store("", taskDefaultMap)
+
 	return models, nil
 }
 
+// devecoModelConfigRaw mirrors the TS ModelConfigSchema, supporting both string and number output.
+type devecoModelConfigRaw struct {
+	ID              int             `json:"id"`
+	ModelID         string          `json:"model_id"`
+	ThinkingMode    string          `json:"thinking_mode"`
+	InputModalities []string        `json:"input_modalities,omitempty"`
+	ContextWindow   int             `json:"context_window,omitempty"`
+	Output          json.RawMessage `json:"output,omitempty"` // can be string or number
+	ToolCallMode    string          `json:"tool_call_mode"`
+}
+
+// parseDevecoOutputLimit handles the TS source's parseOutputLimit which accepts both string and number.
+func parseDevecoOutputLimit(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	// Try number first.
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n
+	}
+	// Try string.
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return 0
+		}
+		var parsed int
+		if _, err := fmt.Sscanf(s, "%d", &parsed); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
 // FetchDevecoModelsDynamic fetches models from the Huawei DevEco API and returns them.
+// Results are cached per auth ID (matching the TS source's module-level cachedConfig).
 // Falls back to default models if the API call fails or returns empty.
 func FetchDevecoModelsDynamic(ctx context.Context, cfg *config.Config, auth *coreauth.Auth) []*registry.ModelInfo {
+	// Return cached models if available (matches TS cachedConfig pattern).
+	if auth != nil && auth.ID != "" {
+		if v, ok := devecoModelCache.Load(auth.ID); ok {
+			if cached, ok := v.([]*registry.ModelInfo); ok && len(cached) > 0 {
+				return cached
+			}
+		}
+	}
+
 	accessToken := extractAccessToken(auth)
 	if accessToken == "" {
 		log.Debug("deveco: no access token for dynamic model fetch, using defaults")
 		return registry.GetDevecoModels()
 	}
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 10*time.Second)
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 5*time.Second)
 	models, err := FetchAndRegisterDevecoModels(ctx, accessToken, "1.0.0", httpClient)
 	if err != nil {
 		log.Debugf("deveco: dynamic model fetch failed (%v), using defaults", err)
@@ -650,6 +827,11 @@ func FetchDevecoModelsDynamic(ctx context.Context, cfg *config.Config, auth *cor
 
 	if len(models) == 0 {
 		return registry.GetDevecoModels()
+	}
+
+	// Cache the results (matches TS module-level cachedConfig).
+	if auth != nil && auth.ID != "" {
+		devecoModelCache.Store(auth.ID, models)
 	}
 	log.Infof("deveco: fetched %d models from API", len(models))
 	return models

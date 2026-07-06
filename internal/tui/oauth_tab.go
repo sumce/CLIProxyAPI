@@ -24,6 +24,7 @@ var oauthProviders = []oauthProvider{
 	{"Antigravity", "antigravity-auth-url", "🟪"},
 	{"Kimi", "kimi-auth-url", "🟫"},
 	{"xAI", "xai-auth-url", "⬛"},
+	{"DevEco (Huawei)", "deveco-auth-url", "🟥"},
 }
 
 // oauthTabModel handles OAuth login flows.
@@ -269,18 +270,20 @@ func (m oauthTabModel) submitCallback(callbackURL string) tea.Cmd {
 		for _, p := range oauthProviders {
 			if p.name == m.providerName {
 				// Map provider name to the canonical key the API expects
-				switch p.apiPath {
-				case "anthropic-auth-url":
-					providerKey = "anthropic"
-				case "codex-auth-url":
-					providerKey = "codex"
-				case "antigravity-auth-url":
-					providerKey = "antigravity"
-				case "kimi-auth-url":
-					providerKey = "kimi"
-				case "xai-auth-url":
-					providerKey = "xai"
-				}
+		switch p.apiPath {
+		case "anthropic-auth-url":
+			providerKey = "anthropic"
+		case "codex-auth-url":
+			providerKey = "codex"
+		case "antigravity-auth-url":
+			providerKey = "antigravity"
+		case "kimi-auth-url":
+			providerKey = "kimi"
+		case "xai-auth-url":
+			providerKey = "xai"
+		case "deveco-auth-url":
+			providerKey = "deveco"
+		}
 				break
 			}
 		}

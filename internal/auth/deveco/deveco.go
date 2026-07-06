@@ -24,15 +24,15 @@ import (
 
 const (
 	DevEcoBaseURL      = "https://cn.devecostudio.huawei.com"
-	authURL            = "console/DevEcoIDE/apply"
+	AuthURL            = "console/DevEcoIDE/apply"
 	tempTokenCheckURL  = "authrouter/auth/api/temptoken/check"
 	jwtTokenCheckURL   = "authrouter/auth/api/jwToken/check"
-	successRedirectURL = "console/DevEcoCode/loginSuccess"
-	failedRedirectURL  = "console/DevEcoCode/loginFailed"
-	appID              = "1008"
+	SuccessRedirectURL = "console/DevEcoCode/loginSuccess"
+	FailedRedirectURL  = "console/DevEcoCode/loginFailed"
+	AppID              = "1008"
 	DefaultCallbackPort = 10101
 	accessTokenTTL     = 30 * time.Minute
-	loginTimeout       = 10 * time.Minute
+	LoginTimeout       = 10 * time.Minute
 	DevecoProviderID   = "deveco"
 )
 
@@ -89,17 +89,17 @@ type JWTClaims struct {
 // 4. Exchange tempToken for JWT
 // 5. Exchange JWT for accessToken
 func (d *DevecoAuth) Login(ctx context.Context, callbackPort int) (*LoginResult, error) {
-	clientSecret, err := generateClientSecret()
+	clientSecret, err := GenerateClientSecret()
 	if err != nil {
 		return nil, fmt.Errorf("deveco auth: generate secret: %w", err)
 	}
 
-	port, err := findAvailablePort(callbackPort)
+	port, err := FindAvailablePort(callbackPort)
 	if err != nil {
 		return nil, fmt.Errorf("deveco auth: find port: %w", err)
 	}
 
-	cbServer := NewCallbackServer(port, clientSecret, DevEcoBaseURL, successRedirectURL, failedRedirectURL)
+	cbServer := NewCallbackServer(port, clientSecret, DevEcoBaseURL, SuccessRedirectURL, FailedRedirectURL)
 	if err := cbServer.Start(); err != nil {
 		return nil, fmt.Errorf("deveco auth: start server: %w", err)
 	}
@@ -110,7 +110,7 @@ func (d *DevecoAuth) Login(ctx context.Context, callbackPort int) (*LoginResult,
 	}()
 
 	loginURL := fmt.Sprintf("%s/%s?port=%d&appid=%s&code=%s",
-		DevEcoBaseURL, authURL, port, appID, clientSecret)
+		DevEcoBaseURL, AuthURL, port, AppID, clientSecret)
 	log.Infof("Opening browser for DevEco login: %s", loginURL)
 	if browser.IsAvailable() {
 		if err := browser.OpenURL(loginURL); err != nil {
@@ -120,12 +120,28 @@ func (d *DevecoAuth) Login(ctx context.Context, callbackPort int) (*LoginResult,
 		log.Warn("deveco auth: no browser available, user must open URL manually")
 	}
 
-	callback, err := cbServer.WaitForCallback(ctx, loginTimeout)
+	callback, err := cbServer.WaitForCallback(ctx, LoginTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("deveco auth: wait callback: %w", err)
 	}
 
-	jwtToken, err := d.exchangeTempToken(ctx, callback.TempToken)
+	return d.LoginWithCallback(ctx, callback)
+}
+
+// LoginWithCallback takes a pre-received callback (e.g. from a management API
+// started callback server) and performs the token exchange steps:
+// 1. Strip tempToken query params
+// 2. Exchange tempToken for JWT
+// 3. Exchange JWT for accessToken + user info
+func (d *DevecoAuth) LoginWithCallback(ctx context.Context, callback *CallbackData) (*LoginResult, error) {
+	// TS source does tempToken.split("&")[0] — the callback may return
+	// "tempToken=xxx&siteId=1" or similar, so strip everything after "&".
+	actualTempToken := callback.TempToken
+	if idx := strings.Index(actualTempToken, "&"); idx >= 0 {
+		actualTempToken = actualTempToken[:idx]
+	}
+
+	jwtToken, err := d.exchangeTempToken(ctx, actualTempToken)
 	if err != nil {
 		return nil, fmt.Errorf("deveco auth: exchange temp token: %w", err)
 	}
@@ -228,7 +244,7 @@ func (d *DevecoAuth) refreshTokenCall(ctx context.Context, jwtToken string) (*Lo
 
 func (d *DevecoAuth) exchangeTempToken(ctx context.Context, tempToken string) (string, error) {
 	reqURL := fmt.Sprintf("%s/%s?tempToken=%s&site=CN&version=1.0.0&appid=%s",
-		DevEcoBaseURL, tempTokenCheckURL, url.QueryEscape(tempToken), appID)
+		DevEcoBaseURL, tempTokenCheckURL, url.QueryEscape(tempToken), AppID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("exchange temp token: %w", err)
@@ -351,7 +367,7 @@ func parseJWT(token string) (*JWTClaims, error) {
 	return &claims, nil
 }
 
-func generateClientSecret() (string, error) {
+func GenerateClientSecret() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -359,7 +375,7 @@ func generateClientSecret() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func findAvailablePort(preferred int) (int, error) {
+func FindAvailablePort(preferred int) (int, error) {
 	ports := []int{preferred, 34567, 34568, 34569, 34570}
 	for _, port := range ports {
 		if portAvailable(port) {

@@ -281,6 +281,28 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		}
 	}
 
+	// DevEco Code config changes
+	if len(oldCfg.Deveco) != len(newCfg.Deveco) {
+		changes = append(changes, fmt.Sprintf("deveco count: %d -> %d", len(oldCfg.Deveco), len(newCfg.Deveco)))
+	} else {
+		for i := range oldCfg.Deveco {
+			o := oldCfg.Deveco[i]
+			n := newCfg.Deveco[i]
+			if o.Enabled != n.Enabled {
+				changes = append(changes, fmt.Sprintf("deveco[%d].enabled: %t -> %t", i, o.Enabled, n.Enabled))
+			}
+			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
+				changes = append(changes, fmt.Sprintf("deveco[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
+			}
+			if o.CallbackPort != n.CallbackPort {
+				changes = append(changes, fmt.Sprintf("deveco[%d].callback-port: %d -> %d", i, o.CallbackPort, n.CallbackPort))
+			}
+			if o.DisableCooling != n.DisableCooling {
+				changes = append(changes, fmt.Sprintf("deveco[%d].disable-cooling: %t -> %t", i, o.DisableCooling, n.DisableCooling))
+			}
+		}
+	}
+
 	// Vertex-compatible API keys
 	if len(oldCfg.VertexCompatAPIKey) != len(newCfg.VertexCompatAPIKey) {
 		changes = append(changes, fmt.Sprintf("vertex-api-key count: %d -> %d", len(oldCfg.VertexCompatAPIKey), len(newCfg.VertexCompatAPIKey)))

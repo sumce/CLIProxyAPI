@@ -710,6 +710,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/vertex-api-key", s.mgmt.DeleteVertexCompatKey)
 
 		mgmt.GET("/deveco", s.mgmt.GetDeveco)
+		mgmt.PUT("/deveco", s.mgmt.PutDeveco)
+		mgmt.PATCH("/deveco", s.mgmt.PatchDeveco)
+		mgmt.DELETE("/deveco", s.mgmt.DeleteDeveco)
 
 		mgmt.GET("/oauth-excluded-models", s.mgmt.GetOAuthExcludedModels)
 		mgmt.PUT("/oauth-excluded-models", s.mgmt.PutOAuthExcludedModels)
@@ -736,6 +739,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
 		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)
+		mgmt.GET("/deveco-auth-url", s.mgmt.RequestDevecoToken)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
 }
