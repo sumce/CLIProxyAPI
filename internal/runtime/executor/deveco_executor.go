@@ -143,6 +143,27 @@ func (a *aggregatedDelta) toCompleteResponse() []byte {
 	return out
 }
 
+// stripEmptyReasoningContent removes choices[0].delta.reasoning_content when it
+// exists but is an empty string. Huawei's SSE stream includes reasoning_content:""
+// in transition chunks where content has already started. Clients like Cherry
+// Studio treat the mere presence of reasoning_content as "still thinking",
+// causing content to be misrendered as a thinking block. Stripping the empty
+// field ensures a clean reasoning→content transition.
+func stripEmptyReasoningContent(payload []byte) []byte {
+	rc := gjson.GetBytes(payload, "choices.0.delta.reasoning_content")
+	if !rc.Exists() || rc.Type != gjson.String {
+		return payload
+	}
+	if rc.String() != "" {
+		return payload
+	}
+	result, err := sjson.DeleteBytes(payload, "choices.0.delta.reasoning_content")
+	if err != nil {
+		return payload
+	}
+	return result
+}
+
 // Execute handles non-streaming DevEco API requests.
 // Internally uses the streaming endpoint (/chat/completions) for consistent latency,
 // collects all SSE chunks, and assembles the final response. This avoids the
@@ -399,6 +420,14 @@ func (e *DevecoExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth,
 						return
 					}
 					continue
+				}
+			}
+			// Strip empty reasoning_content from delta to prevent clients like
+			// Cherry Studio from misidentifying content as thinking blocks
+			// during the reasoning→content transition.
+			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+				if stripped := stripEmptyReasoningContent(payload); !bytes.Equal(stripped, payload) {
+					trimmed = []byte("data: " + string(stripped))
 				}
 			}
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmed), &param)
