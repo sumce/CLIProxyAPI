@@ -25,55 +25,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-
-          git fetch --force --tags
-          previous_tag=""
-          if previous_tag_value="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null)"; then
-            previous_tag="$previous_tag_value"
-          fi
-
-          release_notes="## Release Assets
-
-          - \`CLIProxyAPI_<version>_linux_<arch>.tar.gz\` — default Linux build (GLIBC 2.17 baseline, supports dynamic plugins)
-          - \`CLIProxyAPI_<version>_linux_<arch>_no-plugin.tar.gz\` — portable Linux build for musl/older systems
-          - \`CLIProxyAPI_<version>_darwin_<arch>.tar.gz\` — macOS build
-          - \`CLIProxyAPI_<version>_windows_<arch>.zip\` — Windows build
-          - \`CLIProxyAPI_<version>_freebsd_<arch>.tar.gz\` — FreeBSD build
-          "
-
-          if [[ -n "$previous_tag" ]]; then
-            changelog=$(git log --reverse --pretty=format:'- %s (%h)' "${previous_tag}..${GITHUB_REF_NAME}" | grep -Ev '^- (docs:|test:)' || true)
-          else
-            changelog=$(git log --reverse --pretty=format:'- %s (%h)' "${GITHUB_REF_NAME}" | grep -Ev '^- (docs:|test:)' || true)
-          fi
-
-          if [[ -n "$changelog" ]]; then
-            release_notes="${release_notes}
-
-          ## Changelog
-
-          ${changelog}
-          "
-          fi
-
-          if [[ -n "$previous_tag" ]]; then
-            release_notes="${release_notes}
-
-          **Full Changelog**: https://github.com/${GH_REPO}/compare/${previous_tag}...${GITHUB_REF_NAME}
-          "
-          else
-            release_notes="${release_notes}
-
-          **Full Changelog**: https://github.com/${GH_REPO}/commits/${GITHUB_REF_NAME}
-          "
-          fi
-
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$release_notes"
-          else
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$release_notes"
-          fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes || \
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Release $GITHUB_REF_NAME"
 
   build-hosted:
     name: build ${{ matrix.target }}
